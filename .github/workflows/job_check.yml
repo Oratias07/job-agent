@@ -1,0 +1,41 @@
+name: Job Monitor
+
+on:
+  schedule:
+    # 09:00 and 16:00 Israel time (UTC+3 / UTC+2 DST)
+    - cron: '0 6,13 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write  # Needed to push state/seen_jobs.json back
+
+jobs:
+  check-jobs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps
+
+      - name: Run job monitor
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python scraper/main.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/seen_jobs.json
+          git diff --cached --quiet || git commit -m "chore: update seen_jobs state"
+          git push
