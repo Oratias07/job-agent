@@ -81,6 +81,18 @@ After the baseline run, the agent runs automatically at **09:00** and **16:00** 
 - **Gmail SMTP** — email delivery
 - **GitHub Actions** — free-tier cron scheduling
 
+## Manual Job Submission
+
+Found a job posting yourself? Submit it manually and get a tailored CV + cover letter by email:
+
+1. Go to **Actions → Manual Job - CV & Cover Letter → Run workflow**
+2. Fill in:
+   - **Job title** — e.g. `Software Engineer Intern`
+   - **Company** — e.g. `Google`
+   - **Job URL** — optional link to the posting
+   - **Job description** — paste the full description text
+3. Click **Run workflow** — you'll receive the PDFs by email within a few minutes
+
 ## Filtering
 
 Jobs are matched case-insensitively against title + description using:

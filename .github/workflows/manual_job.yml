@@ -1,0 +1,46 @@
+name: Manual Job - CV & Cover Letter
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_title:
+        description: 'Job title (e.g. Software Engineer Intern)'
+        required: true
+        type: string
+      company:
+        description: 'Company name (e.g. Microsoft)'
+        required: true
+        type: string
+      job_url:
+        description: 'Link to the job posting'
+        required: false
+        type: string
+        default: ''
+      job_description:
+        description: 'Paste the full job description text here'
+        required: true
+        type: string
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install groq weasyprint
+
+      - name: Generate and send
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          JOB_TITLE: ${{ inputs.job_title }}
+          COMPANY: ${{ inputs.company }}
+          JOB_URL: ${{ inputs.job_url }}
+          JOB_DESCRIPTION: ${{ inputs.job_description }}
+        run: python scraper/manual_job.py
