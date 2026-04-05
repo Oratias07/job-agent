@@ -40,6 +40,14 @@ jobs:
       - name: Install dependencies
         run: pip install groq weasyprint
 
+      - name: Debug secrets
+        run: |
+          echo "GROQ_API_KEY length: ${#GROQ_API_KEY}"
+          echo "GMAIL_APP_PASSWORD length: ${#GMAIL_APP_PASSWORD}"
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+
       - name: Generate and send
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
