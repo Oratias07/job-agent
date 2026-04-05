@@ -12,7 +12,7 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-SENDER = "atiasor85@gmail.com"
+SENDER = "chamyproject@gmail.com"
 RECIPIENT = "atiasor85@gmail.com"
 
 
@@ -21,7 +21,12 @@ def send_email(new_jobs: list[dict], attachments: list[Path]) -> None:
     if not new_jobs:
         return
 
-    password = os.environ["GMAIL_APP_PASSWORD"]
+    password = os.environ.get("GMAIL_APP_PASSWORD", "")
+    if not password:
+        raise ValueError("GMAIL_APP_PASSWORD environment variable not set")
+
+    logger.info("Attempting login with password length: %d, first 4 chars: %s, last 4 chars: %s",
+                len(password), password[:4], password[-4:])
     date_str = datetime.now().strftime("%Y-%m-%d")
     companies = sorted({j["company"] for j in new_jobs})
     subject = f"\U0001f195 [{len(new_jobs)}] New Student Jobs | {', '.join(companies)} | {date_str}"
@@ -46,8 +51,12 @@ def send_email(new_jobs: list[dict], attachments: list[Path]) -> None:
         part.add_header("Content-Disposition", f"attachment; filename={filepath.name}")
         msg.attach(part)
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(SENDER, password)
-        server.send_message(msg)
-
-    logger.info("Email sent: %s", subject)
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(SENDER, password)
+            server.send_message(msg)
+        logger.info("Email sent: %s", subject)
+    except smtplib.SMTPAuthenticationError as e:
+        logger.error("Gmail authentication failed: %s", e)
+        logger.error("Sender: %s, Password length: %d", SENDER, len(password))
+        raise
