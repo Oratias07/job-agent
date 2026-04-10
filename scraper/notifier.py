@@ -1,4 +1,4 @@
-"""Send email notification with tailored CV and cover letter PDFs."""
+"""Send email and Telegram notifications with tailored CV and cover letter PDFs."""
 
 import os
 import logging
@@ -10,10 +10,14 @@ from email import encoders
 from pathlib import Path
 from datetime import datetime
 
+import requests
+
 logger = logging.getLogger(__name__)
 
 SENDER = "chamyproject@gmail.com"
 RECIPIENT = "[REDACTED_EMAIL]"
+
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
 
 def send_email(new_jobs: list[dict], attachments: list[Path]) -> None:
@@ -60,3 +64,60 @@ def send_email(new_jobs: list[dict], attachments: list[Path]) -> None:
         logger.error("Gmail authentication failed: %s", e)
         logger.error("Sender: %s, Password length: %d", SENDER, len(password))
         raise
+
+
+def send_telegram(new_jobs: list[dict], attachments: list[Path]) -> None:
+    """Send Telegram message + PDF attachments for each new job.
+
+    Requires env vars:
+      TELEGRAM_BOT_TOKEN — bot token from @BotFather
+      TELEGRAM_CHAT_ID   — your personal chat ID (send /start to the bot, then
+                           query https://api.telegram.org/bot<TOKEN>/getUpdates)
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        logger.warning("Telegram not configured — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+        return
+
+    def _api(method: str, **kwargs):
+        url = TELEGRAM_API.format(token=token, method=method)
+        resp = requests.post(url, timeout=30, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+    # Build summary message
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [f"🆕 *{len(new_jobs)} new job(s) found* — {date_str}\n"]
+    for i, job in enumerate(new_jobs, 1):
+        lines.append(
+            f"{i}\\. *{_tg_escape(job['title'])}* — {_tg_escape(job['company'])}\n"
+            f"   [{_tg_escape(job['url'])}]({job['url']})"
+        )
+    lines.append(f"\n_{len(attachments)} PDF(s) follow_")
+    text = "\n".join(lines)
+
+    try:
+        _api("sendMessage", data={"chat_id": chat_id, "text": text, "parse_mode": "MarkdownV2"})
+    except Exception:
+        logger.exception("Telegram: failed to send summary message")
+
+    # Send each PDF as a document
+    for pdf_path in attachments:
+        try:
+            with pdf_path.open("rb") as f:
+                _api(
+                    "sendDocument",
+                    data={"chat_id": chat_id},
+                    files={"document": (pdf_path.name, f, "application/pdf")},
+                )
+            logger.info("Telegram: sent %s", pdf_path.name)
+        except Exception:
+            logger.exception("Telegram: failed to send %s", pdf_path.name)
+
+
+def _tg_escape(text: str) -> str:
+    """Escape special chars for Telegram MarkdownV2."""
+    for ch in r"\_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, f"\\{ch}")
+    return text

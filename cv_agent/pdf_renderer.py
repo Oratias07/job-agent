@@ -1,5 +1,6 @@
 """Convert Markdown content to styled PDF using WeasyPrint."""
 
+import html as html_lib
 import logging
 import re
 from pathlib import Path
@@ -63,8 +64,19 @@ strong {
 """
 
 
+_SAFE_URL_SCHEMES = ("https://", "http://", "mailto:")
+
+
+def _safe_url(url: str) -> str:
+    """Allow only http/https/mailto URLs; replace anything else with '#'."""
+    stripped = url.strip()
+    if any(stripped.lower().startswith(scheme) for scheme in _SAFE_URL_SCHEMES):
+        return html_lib.escape(stripped, quote=True)
+    return "#"
+
+
 def _markdown_to_html(md: str) -> str:
-    """Minimal Markdown-to-HTML conversion (no external dependency)."""
+    """Minimal Markdown-to-HTML conversion with HTML-escaping for safety."""
     lines = md.split("\n")
     html_lines = []
     in_list = False
@@ -72,27 +84,27 @@ def _markdown_to_html(md: str) -> str:
     for line in lines:
         stripped = line.strip()
 
-        # Headings
+        # Headings — escape content before inserting into tags
         if stripped.startswith("### "):
             if in_list:
                 html_lines.append("</ul>")
                 in_list = False
-            html_lines.append(f"<h3>{stripped[4:]}</h3>")
+            html_lines.append(f"<h3>{html_lib.escape(stripped[4:])}</h3>")
         elif stripped.startswith("## "):
             if in_list:
                 html_lines.append("</ul>")
                 in_list = False
-            html_lines.append(f"<h2>{stripped[3:]}</h2>")
+            html_lines.append(f"<h2>{html_lib.escape(stripped[3:])}</h2>")
         elif stripped.startswith("# "):
             if in_list:
                 html_lines.append("</ul>")
                 in_list = False
-            html_lines.append(f"<h1>{stripped[2:]}</h1>")
+            html_lines.append(f"<h1>{html_lib.escape(stripped[2:])}</h1>")
         elif stripped.startswith("- "):
             if not in_list:
                 html_lines.append("<ul>")
                 in_list = True
-            html_lines.append(f"<li>{stripped[2:]}</li>")
+            html_lines.append(f"<li>{html_lib.escape(stripped[2:])}</li>")
         elif stripped == "":
             if in_list:
                 html_lines.append("</ul>")
@@ -102,23 +114,27 @@ def _markdown_to_html(md: str) -> str:
             if in_list:
                 html_lines.append("</ul>")
                 in_list = False
-            html_lines.append(f"<p>{stripped}</p>")
+            html_lines.append(f"<p>{html_lib.escape(stripped)}</p>")
 
     if in_list:
         html_lines.append("</ul>")
 
-    html = "\n".join(html_lines)
+    result = "\n".join(html_lines)
 
-    # Inline formatting
-    html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", html)
-    html = re.sub(r"\*(.+?)\*", r"<em>\1</em>", html)
-    html = re.sub(
+    # Inline formatting — applied AFTER escaping, so we work on escaped text.
+    # **bold** and *italic* delimiters are not HTML-special so they survive escaping unchanged.
+    result = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", result)
+    result = re.sub(r"\*(.+?)\*", r"<em>\1</em>", result)
+
+    # Links: text is already escaped; URL goes through _safe_url.
+    # After html.escape, square brackets and parens are unchanged.
+    result = re.sub(
         r"\[([^\]]+)\]\(([^)]+)\)",
-        r'<a href="\2">\1</a>',
-        html,
+        lambda m: f'<a href="{_safe_url(m.group(2))}">{m.group(1)}</a>',
+        result,
     )
 
-    return html
+    return result
 
 
 def render_pdf(markdown_content: str, output_path: str | Path) -> Path:

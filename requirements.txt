@@ -3,3 +3,5 @@ beautifulsoup4
 playwright
 groq
 weasyprint
+pytest
+pytest-mock

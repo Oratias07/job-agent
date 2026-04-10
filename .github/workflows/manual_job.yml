@@ -1,25 +1,28 @@
-name: Manual Job - CV & Cover Letter
+name: Manual Job — Generate CV from URL or Text
 
 on:
   workflow_dispatch:
     inputs:
-      job_title:
-        description: 'Job title (e.g. Software Engineer Intern)'
-        required: true
-        type: string
-      company:
-        description: 'Company name (e.g. Microsoft)'
-        required: true
-        type: string
       job_url:
-        description: 'Link to the job posting'
+        description: 'Job posting URL (auto-scrapes title + description — easiest)'
+        required: false
+        type: string
+        default: ''
+      job_title:
+        description: 'Job title — only needed if NOT using job_url'
+        required: false
+        type: string
+        default: ''
+      company:
+        description: 'Company name — only needed if NOT using job_url'
         required: false
         type: string
         default: ''
       job_description:
-        description: 'Paste the full job description text here'
-        required: true
+        description: 'Paste job description — only needed if NOT using job_url'
+        required: false
         type: string
+        default: ''
 
 jobs:
   generate:
@@ -35,25 +38,24 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libffi-dev shared-mime-info
+          sudo apt-get install -y \
+            libpango-1.0-0 libpangocairo-1.0-0 \
+            libgdk-pixbuf2.0-0 libffi-dev shared-mime-info
 
-      - name: Install dependencies
-        run: pip install groq weasyprint
-
-      - name: Debug secrets
+      - name: Install Python dependencies
         run: |
-          echo "GROQ_API_KEY length: ${#GROQ_API_KEY}"
-          echo "GMAIL_APP_PASSWORD length: ${#GMAIL_APP_PASSWORD}"
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          pip install requests beautifulsoup4 groq weasyprint playwright
+          playwright install chromium
+          playwright install-deps
 
-      - name: Generate and send
+      - name: Generate and send CV
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_URL: ${{ inputs.job_url }}
           JOB_TITLE: ${{ inputs.job_title }}
           COMPANY: ${{ inputs.company }}
-          JOB_URL: ${{ inputs.job_url }}
           JOB_DESCRIPTION: ${{ inputs.job_description }}
         run: python scraper/manual_job.py
