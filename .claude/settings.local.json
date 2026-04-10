@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git pull:*)",
+      "Bash(git stash:*)",
+      "Bash(gh run:*)",
+      "Bash(powershell:*)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(python -m pip install pytest pytest-mock)",
+      "Bash(python:*)",
+      "Bash(export PATH=\"$PATH:/c/Users/atias/.fly/bin\")",
+      "Bash(flyctl version:*)",
+      "Bash(flyctl auth:*)",
+      "Bash(flyctl launch:*)",
+      "Bash(flyctl deploy:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(fly deploy:*)",
+      "Bash(~/.fly/bin/fly deploy:*)",
+      "Bash(~/.fly/bin/fly logs:*)"
+    ]
+  }
+}
