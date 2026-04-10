@@ -1,0 +1,15 @@
+# Fly.io config for the Telegram bot (always-on, free tier)
+# Deploy with: fly launch --no-deploy  then  fly deploy
+app = "job-agent-bot"
+primary_region = "fra"   # Frankfurt — lowest latency to Israel
+
+[build]
+  dockerfile = "Dockerfile.bot"
+
+# No HTTP service — the bot uses Telegram long-polling (outbound only)
+# Fly.io keeps the process alive as a worker
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

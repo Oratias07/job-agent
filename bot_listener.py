@@ -25,7 +25,12 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+
+try:
+    from playwright.sync_api import sync_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
 
 # ── Project path ────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -95,6 +100,8 @@ def _extract_with_requests(url: str) -> tuple[str, str, str]:
 
 def _extract_with_playwright(url: str) -> tuple[str, str, str]:
     """Slow path: render JS-heavy pages with Playwright."""
+    if not _PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError("Playwright is not installed in this environment.")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -172,11 +179,23 @@ def _parse_soup(soup: BeautifulSoup, url: str) -> tuple[str, str, str]:
 def fetch_job_page(url: str) -> tuple[str, str, str]:
     """Return (title, company, description) for a job URL.
 
-    Tries fast HTTP first; falls back to Playwright for JS-rendered pages.
+    Tries fast HTTP first; falls back to Playwright if available.
+    On Fly.io / lightweight deployments Playwright is not installed —
+    in that case a clear error is raised so the bot can tell the user.
     """
     try:
         return _extract_with_requests(url)
     except Exception as e:
+        if not _PLAYWRIGHT_AVAILABLE:
+            raise RuntimeError(
+                f"Could not fetch this page with plain HTTP ({e}). "
+                "The page likely requires JavaScript to load. "
+                "Try copying the job description text and sending it as:\n\n"
+                "<code>title: Software Engineer Intern\n"
+                "company: Acme Corp\n"
+                "---\n"
+                "[paste description here]</code>"
+            )
         logger.info("Fast HTTP failed (%s), retrying with Playwright", e)
     return _extract_with_playwright(url)
 
@@ -232,12 +251,80 @@ def _he(text: str) -> str:
 
 # ── Bot loop ──────────────────────────────────────────────────────────────────
 
+_PLAYWRIGHT_NOTE = (
+    "" if _PLAYWRIGHT_AVAILABLE else
+    "\n\n⚠️ <b>JS-rendered pages:</b> If a URL fails, paste the job manually:\n"
+    "<code>title: Software Engineer Intern\ncompany: Acme Corp\n---\n[description here]</code>"
+)
+
 HELP_TEXT = (
     "👋 <b>Job CV Bot</b>\n\n"
-    "Send me any job posting URL and I'll generate a tailored CV + cover letter for you.\n\n"
-    "Example:\n"
-    "<code>https://jobs.nvidia.com/jobs/XXXXX</code>"
+    "Send me a job posting URL and I'll generate a tailored CV + cover letter.\n\n"
+    "<b>Option 1 — URL:</b>\n"
+    "<code>https://jobs.nvidia.com/jobs/XXXXX</code>\n\n"
+    "<b>Option 2 — Manual text</b> (if URL fails):\n"
+    "<code>title: Software Engineer Intern\n"
+    "company: Acme Corp\n"
+    "---\n"
+    "[paste full job description here]</code>"
+    + _PLAYWRIGHT_NOTE
 )
+
+
+def _handle_manual_text(token: str, chat_id: int, text: str) -> None:
+    """Parse manual format and generate CV without fetching any URL.
+
+    Expected format:
+        title: Software Engineer Intern
+        company: Acme Corp
+        ---
+        <full job description>
+    """
+    try:
+        header, _, description = text.partition("---")
+        title, company = "", ""
+        for line in header.splitlines():
+            if line.lower().startswith("title:"):
+                title = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("company:"):
+                company = line.split(":", 1)[1].strip()
+        description = description.strip()
+        if not title or not company or not description:
+            _send(token, chat_id,
+                  "❌ Could not parse the text. Use this format:\n\n"
+                  "<code>title: Job Title\ncompany: Company Name\n---\nDescription here</code>")
+            return
+    except Exception as e:
+        _send(token, chat_id, f"❌ Parse error: {_he(str(e))}")
+        return
+
+    _send(token, chat_id,
+          f"📋 <b>{_he(title)}</b> at {_he(company)}\n⚙️ Generating CV...")
+
+    try:
+        cv_md = generate_tailored_cv(title, company, description)
+        cl_md = generate_cover_letter(title, company, description)
+    except Exception as e:
+        _send(token, chat_id, f"❌ CV generation failed: {_he(str(e))}")
+        return
+
+    safe_title = re.sub(r"[^A-Za-z0-9]+", "", title)[:40]
+    safe_company = re.sub(r"[^A-Za-z0-9]+", "", company)[:30]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        try:
+            cv_path = render_pdf(cv_md, tmp / f"OrAtias_CV_{safe_company}_{safe_title}.pdf")
+            cl_path = render_pdf(cl_md, tmp / f"OrAtias_CoverLetter_{safe_company}_{safe_title}.pdf")
+        except Exception as e:
+            _send(token, chat_id, f"❌ PDF rendering failed: {_he(str(e))}")
+            return
+
+        _send(token, chat_id, "✅ Done! Sending PDFs...")
+        _send_pdf(token, chat_id, cv_path)
+        _send_pdf(token, chat_id, cl_path)
+
+    logger.info("Sent CV (manual text) for '%s' at '%s'", title, company)
 
 
 def run(token: str) -> None:
@@ -272,10 +359,15 @@ def run(token: str) -> None:
                 _send(token, chat_id, HELP_TEXT)
                 continue
 
+            # Manual text format: "title: ...\ncompany: ...\n---\n<description>"
+            if text.lower().startswith("title:") and "---" in text:
+                _handle_manual_text(token, chat_id, text)
+                continue
+
             urls = URL_RE.findall(text)
             if not urls:
                 _send(token, chat_id,
-                      "📎 Please send a job posting URL (starting with http:// or https://)")
+                      "📎 Send a job URL, or type /help to see the manual text format.")
                 continue
 
             # Process the first URL found
