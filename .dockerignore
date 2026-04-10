@@ -1,0 +1,10 @@
+output/
+state/seen_jobs.json
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+tests/
+.claude/
+test_gmail.py
