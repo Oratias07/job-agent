@@ -1,5 +1,6 @@
 """Scraper for Microsoft R&D Israel jobs page (static HTML)."""
 
+import hashlib
 import logging
 import requests
 from bs4 import BeautifulSoup
@@ -44,7 +45,7 @@ def scrape() -> list[dict]:
         if link and not link.startswith("http"):
             link = f"https://www.microsoftrnd.co.il{link}"
 
-        job_id = f"msrnd-{hash(title + link) & 0xFFFFFFFF:08x}"
+        job_id = f"msrnd-{hashlib.md5((title + link).encode()).hexdigest()[:8]}"
 
         jobs.append({
             "id": job_id,
@@ -63,7 +64,7 @@ def scrape() -> list[dict]:
                 link = a["href"]
                 if not link.startswith("http"):
                     link = f"https://www.microsoftrnd.co.il{link}"
-                job_id = f"msrnd-{hash(text + link) & 0xFFFFFFFF:08x}"
+                job_id = f"msrnd-{hashlib.md5((text + link).encode()).hexdigest()[:8]}"
                 jobs.append({
                     "id": job_id,
                     "title": text,

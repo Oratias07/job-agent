@@ -1,5 +1,6 @@
 """Scraper for NVIDIA Careers — prefers the REST API, falls back to Playwright."""
 
+import hashlib
 import logging
 import requests
 from playwright.sync_api import sync_playwright
@@ -47,7 +48,7 @@ def _scrape_api() -> list[dict]:
         if not _matches_keywords(title + " " + description):
             continue
 
-        job_id = f"nvidia-{posting.get('bulletFields', [''])[0]}-{hash(title) & 0xFFFFFFFF:08x}"
+        job_id = f"nvidia-{hashlib.md5(title.encode()).hexdigest()[:8]}"
         if external_path:
             # Use the path slug as a more stable ID
             job_id = f"nvidia-{external_path.strip('/').split('/')[-1]}"
@@ -95,7 +96,7 @@ def _scrape_playwright() -> list[dict]:
                 if link and not link.startswith("http"):
                     link = f"https://jobs.nvidia.com{link}"
 
-                job_id = f"nvidia-{hash(title_text + link) & 0xFFFFFFFF:08x}"
+                job_id = f"nvidia-{hashlib.md5((title_text + link).encode()).hexdigest()[:8]}"
                 jobs.append({
                     "id": job_id,
                     "title": title_text,

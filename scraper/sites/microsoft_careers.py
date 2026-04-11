@@ -1,5 +1,6 @@
 """Scraper for Microsoft Careers global site (JS-rendered, uses Playwright)."""
 
+import hashlib
 import logging
 from playwright.sync_api import sync_playwright
 
@@ -63,7 +64,7 @@ def scrape() -> list[dict]:
                         link = f"https://apply.careers.microsoft.com{link}"
 
                     # Try to extract a job ID from the link or card
-                    job_id = f"mscareer-{hash(title_text + link) & 0xFFFFFFFF:08x}"
+                    job_id = f"mscareer-{hashlib.md5((title_text + link).encode()).hexdigest()[:8]}"
 
                     jobs.append({
                         "id": job_id,

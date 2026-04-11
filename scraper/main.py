@@ -88,6 +88,57 @@ def _normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+# ---------------------------------------------------------------------------
+# Relevance filtering — keep only hi-tech student/intern roles
+# ---------------------------------------------------------------------------
+
+# Title patterns that clearly indicate a non-tech role (regex, case-insensitive)
+_NON_TECH_TITLE_PATTERNS: list[str] = [
+    r"\bhr\b", r"human resources?", r"hr generalist", r"hr manager",
+    r"מנהל משמרת", r"מלצר", r"מלצרית", r"שף", r"טבח", r"בריסטה", r"ברמן",
+    r"קופאי", r"קופאית", r"מוכר(?!\s+טכני)", r"מוכרת",
+    r"shift manager", r"waiter", r"waitress", r"barista", r"chef",
+    r"restaurant manager", r"hospitality",
+]
+
+# At least one of these must appear in the title for jobs from general boards
+_TECH_TITLE_KEYWORDS: list[str] = [
+    "developer", "engineer", "software", "data", "backend", "frontend",
+    "fullstack", "full-stack", "full stack", "machine learning", "cloud",
+    "devops", "dev ops", "cyber", "security", "algorithm", "research",
+    "programmer", "architect", "analytics", "infrastructure", "platform",
+    "embedded", "firmware", "mobile", "android", "ios", "web dev",
+    # Hebrew
+    "מפתח", "מפתחת", "תוכנה", "נתונים", "ענן", "בינה מלאכותית",
+    "קיברנט", "אנדרואיד", "מערכות", "אבטחה", "תשתיות",
+]
+
+# Companies with curated tech-only scraping — skip the tech-keyword title check
+_CURATED_TECH_COMPANIES: set[str] = {"microsoft r&d israel", "microsoft", "nvidia"}
+
+
+def _is_relevant_job(job: dict) -> bool:
+    """Return False for clearly non-tech or off-target roles."""
+    title_lower = job["title"].lower()
+
+    # Block non-tech roles from any source
+    for pattern in _NON_TECH_TITLE_PATTERNS:
+        if re.search(pattern, title_lower, re.IGNORECASE):
+            logger.info("Filtered non-tech job: '%s' at %s", job["title"], job["company"])
+            return False
+
+    # For general job boards, require at least one tech keyword in the title
+    if job["company"].lower() not in _CURATED_TECH_COMPANIES:
+        if not any(kw in title_lower for kw in _TECH_TITLE_KEYWORDS):
+            logger.info(
+                "Filtered job with no tech title keyword: '%s' at %s",
+                job["title"], job["company"],
+            )
+            return False
+
+    return True
+
+
 def _deduplicate(jobs: list[dict]) -> list[dict]:
     """Remove duplicate jobs across sources.
 
@@ -124,7 +175,7 @@ def main() -> None:
         ("Indeed Israel", indeed.scrape),
         ("AllJobs", alljobs.scrape),
         ("Drushim", drushim.scrape),
-        ("HiemeTech", hiemetech.scrape),
+        ("HiremeTech", hiemetech.scrape),
     ]:
         try:
             jobs = scrape_fn()
@@ -137,6 +188,13 @@ def main() -> None:
     pre_dedup = len(all_jobs)
     all_jobs = _deduplicate(all_jobs)
     logger.info("Total after deduplication: %d (was %d)", len(all_jobs), pre_dedup)
+
+    # --- Relevance filter — drop non-tech / off-target roles ---
+    pre_filter = len(all_jobs)
+    all_jobs = [j for j in all_jobs if _is_relevant_job(j)]
+    filtered = pre_filter - len(all_jobs)
+    if filtered:
+        logger.info("Relevance filter: dropped %d irrelevant job(s)", filtered)
 
     # --- Detect new jobs ---
     # Exclude jobs that: (a) were already sent, OR (b) are from the first-run baseline.

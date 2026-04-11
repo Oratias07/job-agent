@@ -1,12 +1,13 @@
-"""Scraper for HiemeTech.com — tech-focused job board (Playwright, JS-rendered)."""
+"""Scraper for HiremeTech.com — tech-focused job board (Playwright, JS-rendered)."""
 
+import hashlib
 import logging
 from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://www.hiemetech.com"
-SEARCH_URL = "https://www.hiemetech.com/jobs"
+BASE_URL = "https://www.hiremetech.com"
+SEARCH_URL = "https://www.hiremetech.com/jobs"
 
 KEYWORDS = ["student", "intern", "internship", "junior", "entry", "graduate",
             "סטודנט", "התמחות", "ג'וניור", "פיתוח"]
@@ -18,7 +19,7 @@ def _matches_keywords(text: str) -> bool:
 
 
 def scrape() -> list[dict]:
-    """Return list of job dicts from HiemeTech."""
+    """Return list of job dicts from HiremeTech."""
     jobs: list[dict] = []
     try:
         with sync_playwright() as p:
@@ -76,9 +77,9 @@ def scrape() -> list[dict]:
                                 "[class*='company'], [class*='Company'], "
                                 "[class*='employer'], span[class*='org']"
                             )
-                            company = company_el.inner_text().strip() if company_el else "Unknown (HiemeTech)"
+                            company = company_el.inner_text().strip() if company_el else "Unknown (HiremeTech)"
 
-                            job_id = f"hiemetech-{hash(title_text + link) & 0xFFFFFFFF:08x}"
+                            job_id = f"hiemetech-{hashlib.md5((title_text + link).encode()).hexdigest()[:8]}"
 
                             # Avoid duplicates within this scraper
                             if not any(j["id"] == job_id for j in jobs):
@@ -90,15 +91,15 @@ def scrape() -> list[dict]:
                                     "description": card_text,
                                 })
                         except Exception:
-                            logger.debug("HiemeTech: failed to parse card", exc_info=True)
+                            logger.debug("HiremeTech: failed to parse card", exc_info=True)
 
                 except Exception:
-                    logger.debug("HiemeTech: failed to search for '%s'", search_term, exc_info=True)
+                    logger.debug("HiremeTech: failed to search for '%s'", search_term, exc_info=True)
 
             browser.close()
 
     except Exception:
-        logger.exception("HiemeTech: scrape failed")
+        logger.exception("HiremeTech: scrape failed")
 
-    logger.info("HiemeTech: found %d matching jobs", len(jobs))
+    logger.info("HiremeTech: found %d matching jobs", len(jobs))
     return jobs

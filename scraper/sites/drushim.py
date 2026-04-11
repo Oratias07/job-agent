@@ -1,5 +1,6 @@
 """Scraper for Drushim.co.il — Israeli job board (Playwright, JS-rendered)."""
 
+import hashlib
 import logging
 from playwright.sync_api import sync_playwright
 
@@ -72,7 +73,7 @@ def scrape() -> list[dict]:
                     )
                     company = company_el.inner_text().strip() if company_el else "Unknown (Drushim)"
 
-                    job_id = f"drushim-{hash(title_text + link) & 0xFFFFFFFF:08x}"
+                    job_id = f"drushim-{hashlib.md5((title_text + link).encode()).hexdigest()[:8]}"
 
                     jobs.append({
                         "id": job_id,
