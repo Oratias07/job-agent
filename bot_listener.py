@@ -1,19 +1,23 @@
 """
 Telegram bot — accepts job URLs, replies with tailored CV + cover letter PDFs.
 
+Each Telegram user stores their own CV in user_data/{chat_id}.json.
+The bot prompts new users to upload their CV before processing any job URLs.
+
 Usage:
     TELEGRAM_BOT_TOKEN=<token> GROQ_API_KEY=<key> python bot_listener.py
 
-Send any message containing a job URL (http:// or https://) to the bot.
+Send a job posting URL (http:// or https://) after registering your CV.
 The bot will:
   1. Fetch and parse the job page
   2. Generate a tailored CV and cover letter via Groq
   3. Reply with both PDFs
 
-Run this script on any machine (locally, a VPS, Railway, Render, etc.)
-with the two env vars set.  It uses long-polling — no webhook/server needed.
+Run this script on any machine with the two env vars set.
+It uses long-polling — no webhook/server needed.
 """
 
+import json
 import logging
 import os
 import re
@@ -52,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+TELEGRAM_FILE_URL = "https://api.telegram.org/file/bot{token}/{file_path}"
 URL_RE = re.compile(r"https?://\S+")
 HEADERS = {
     "User-Agent": (
@@ -60,6 +65,24 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
+
+USER_DATA_DIR = PROJECT_ROOT / "user_data"
+MIN_CV_LENGTH = 100  # characters — anything shorter is rejected as too short
+
+
+# ── User data storage ─────────────────────────────────────────────────────────
+
+def _load_user_data(chat_id: int) -> dict:
+    path = USER_DATA_DIR / f"{chat_id}.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {"chat_id": chat_id}
+
+
+def _save_user_data(data: dict) -> None:
+    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = USER_DATA_DIR / f"{data['chat_id']}.json"
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ── Telegram helpers ─────────────────────────────────────────────────────────
@@ -92,6 +115,133 @@ def _send_pdf(token: str, chat_id: int, pdf_path: Path) -> None:
         logger.exception("Failed to send PDF %s", pdf_path.name)
 
 
+def _he(text: str) -> str:
+    """Escape HTML special chars for Telegram HTML parse mode."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ── File download & text extraction ──────────────────────────────────────────
+
+def _download_telegram_file(token: str, file_id: str) -> bytes:
+    file_info = _api(token, "getFile", data={"file_id": file_id})
+    file_path = file_info["result"]["file_path"]
+    url = TELEGRAM_FILE_URL.format(token=token, file_path=file_path)
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    return resp.content
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    try:
+        import io
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    except ImportError:
+        raise RuntimeError(
+            "pypdf is not installed. Please paste your CV as plain text instead."
+        )
+    except Exception as e:
+        raise RuntimeError(f"Could not extract text from PDF: {e}") from e
+
+
+def _extract_docx_text(docx_bytes: bytes) -> str:
+    try:
+        import io
+        import docx
+        doc = docx.Document(io.BytesIO(docx_bytes))
+        return "\n".join(para.text for para in doc.paragraphs if para.text).strip()
+    except ImportError:
+        raise RuntimeError(
+            "python-docx is not installed. Please paste your CV as plain text instead."
+        )
+    except Exception as e:
+        raise RuntimeError(f"Could not extract text from docx: {e}") from e
+
+
+# ── CV registration flow ──────────────────────────────────────────────────────
+
+def _handle_start(token: str, chat_id: int, user_data: dict) -> None:
+    if user_data.get("cv_text"):
+        _send(token, chat_id,
+              "👋 Your CV is already on file.\n\n"
+              "Send me a job URL to get a tailored CV + cover letter.\n"
+              "Use /updatecv to replace your stored CV.\n"
+              "Use /help to see all options."
+              + _PLAYWRIGHT_NOTE)
+    else:
+        user_data["awaiting_cv"] = True
+        _save_user_data(user_data)
+        _send(token, chat_id,
+              "👋 <b>Welcome to Job CV Bot!</b>\n\n"
+              "To get started, please send me your CV:\n"
+              "• <b>Paste it</b> as plain text, or\n"
+              "• <b>Upload</b> a <code>.pdf</code> or <code>.docx</code> file\n\n"
+              "Once your CV is saved, send me any job URL and I'll generate "
+              "a tailored CV + cover letter for you.")
+
+
+def _store_cv(token: str, chat_id: int, user_data: dict, cv_text: str) -> None:
+    """Validate and persist a CV string; sends confirmation."""
+    if len(cv_text) < MIN_CV_LENGTH:
+        _send(token, chat_id,
+              f"❌ That looks too short to be a CV ({len(cv_text)} characters). "
+              "Please paste your full CV text or upload a PDF/docx file.")
+        user_data["awaiting_cv"] = True
+        _save_user_data(user_data)
+        return
+    user_data["cv_text"] = cv_text
+    user_data["awaiting_cv"] = False
+    _save_user_data(user_data)
+    _send(token, chat_id,
+          "✅ CV saved! Now send me a job URL and I'll generate a tailored CV + cover letter.")
+
+
+def _handle_document(token: str, chat_id: int, document: dict, user_data: dict) -> None:
+    awaiting_cv = user_data.get("awaiting_cv", False)
+    has_cv = bool(user_data.get("cv_text"))
+
+    if not awaiting_cv and has_cv:
+        _send(token, chat_id,
+              "📄 To update your stored CV, use /updatecv first, then send the file.")
+        return
+
+    mime_type = document.get("mime_type", "")
+    file_name = document.get("file_name", "")
+    file_id = document.get("file_id", "")
+
+    if not file_id:
+        _send(token, chat_id, "❌ Could not read the uploaded file.")
+        return
+
+    _send(token, chat_id, "⏳ Processing your CV file...")
+
+    try:
+        file_bytes = _download_telegram_file(token, file_id)
+    except Exception as e:
+        _send(token, chat_id, f"❌ Could not download file:\n<code>{_he(str(e))}</code>")
+        return
+
+    try:
+        if mime_type == "application/pdf" or file_name.lower().endswith(".pdf"):
+            cv_text = _extract_pdf_text(file_bytes)
+        elif (mime_type in (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword",
+        ) or file_name.lower().endswith((".docx", ".doc"))):
+            cv_text = _extract_docx_text(file_bytes)
+        else:
+            _send(token, chat_id,
+                  "❌ Unsupported file type. Please upload a <code>.pdf</code> or "
+                  "<code>.docx</code> file, or paste your CV as plain text.")
+            return
+    except RuntimeError as e:
+        _send(token, chat_id, f"❌ {_he(str(e))}")
+        return
+
+    _store_cv(token, chat_id, user_data, cv_text)
+
+
 # ── Job page scraping ─────────────────────────────────────────────────────────
 
 def _extract_with_requests(url: str) -> tuple[str, str, str]:
@@ -121,7 +271,6 @@ def _parse_soup(soup: BeautifulSoup, url: str) -> tuple[str, str, str]:
     """Extract (title, company, description) from a BeautifulSoup document."""
     # ── Title ──
     title = ""
-    # Prefer <title> or OG tags first
     og_title = soup.find("meta", property="og:title")
     if og_title and og_title.get("content"):
         title = og_title["content"].strip()
@@ -131,7 +280,6 @@ def _parse_soup(soup: BeautifulSoup, url: str) -> tuple[str, str, str]:
     if not title:
         page_title = soup.find("title")
         title = page_title.get_text(strip=True) if page_title else ""
-    # Strip " - Company Name" suffixes from page titles
     title = re.split(r"\s*[|\-–—]\s*", title)[0].strip()
 
     # ── Company ──
@@ -140,20 +288,16 @@ def _parse_soup(soup: BeautifulSoup, url: str) -> tuple[str, str, str]:
     if og_site and og_site.get("content"):
         company = og_site["content"].strip()
     if not company:
-        # Try common patterns: "at Company", "@ Company", schema.org hiringOrganization
         hiring_org = soup.find(attrs={"itemprop": "hiringOrganization"})
         if hiring_org:
             company = hiring_org.get_text(strip=True)
     if not company:
-        # Fallback to domain name
         company = urlparse(url).netloc.replace("www.", "").split(".")[0].capitalize()
 
     # ── Description ──
-    # Remove boilerplate (nav, header, footer, scripts)
     for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
         tag.decompose()
 
-    # Prefer the element with the most text that looks like a job description
     description = ""
     candidates = soup.find_all(
         ["div", "section", "article"],
@@ -168,14 +312,12 @@ def _parse_soup(soup: BeautifulSoup, url: str) -> tuple[str, str, str]:
         description = best.get_text(separator="\n", strip=True)
 
     if not description:
-        # Broad fallback: main content area
         main = soup.find("main") or soup.find("article") or soup.find("body")
         if main:
             description = main.get_text(separator="\n", strip=True)
 
-    # Trim excessive whitespace lines
     lines = [ln.strip() for ln in description.splitlines() if ln.strip()]
-    description = "\n".join(lines[:300])  # cap at ~300 meaningful lines
+    description = "\n".join(lines[:300])
 
     return title or "Unknown Title", company or "Unknown Company", description or "No description found."
 
@@ -184,8 +326,6 @@ def fetch_job_page(url: str) -> tuple[str, str, str]:
     """Return (title, company, description) for a job URL.
 
     Tries fast HTTP first; falls back to Playwright if available.
-    On Fly.io / lightweight deployments Playwright is not installed —
-    in that case a clear error is raised so the bot can tell the user.
     """
     try:
         return _extract_with_requests(url)
@@ -206,13 +346,23 @@ def fetch_job_page(url: str) -> tuple[str, str, str]:
 
 # ── CV generation ─────────────────────────────────────────────────────────────
 
-def generate_and_send_cv(token: str, chat_id: int, url: str) -> None:
+def _safe_name(first_name: str) -> str:
+    """Sanitize a Telegram first_name for use in filenames."""
+    return re.sub(r"[^A-Za-z0-9]+", "", first_name)[:20] or "User"
+
+
+def generate_and_send_cv(
+    token: str, chat_id: int, url: str, user_data: dict, first_name: str
+) -> None:
+    user_cv = user_data["cv_text"]
+    name_slug = _safe_name(first_name)
+
     _send(token, chat_id, "⏳ Fetching job page...")
 
     try:
         title, company, description = fetch_job_page(url)
     except Exception as e:
-        _send(token, chat_id, f"❌ Could not fetch the job page:\n<code>{e}</code>")
+        _send(token, chat_id, f"❌ Could not fetch the job page:\n<code>{_he(str(e))}</code>")
         return
 
     _send(
@@ -223,8 +373,8 @@ def generate_and_send_cv(token: str, chat_id: int, url: str) -> None:
     )
 
     try:
-        cv_md = generate_tailored_cv(title, company, description)
-        cl_md = generate_cover_letter(title, company, description)
+        cv_md = generate_tailored_cv(title, company, description, user_cv)
+        cl_md = generate_cover_letter(title, company, description, user_cv)
     except Exception as e:
         _send(token, chat_id, f"❌ CV generation failed:\n<code>{_he(str(e))}</code>")
         return
@@ -235,8 +385,8 @@ def generate_and_send_cv(token: str, chat_id: int, url: str) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         try:
-            cv_path = render_pdf(cv_md, tmp / f"OrAtias_CV_{safe_company}_{safe_title}.pdf")
-            cl_path = render_pdf(cl_md, tmp / f"OrAtias_CoverLetter_{safe_company}_{safe_title}.pdf")
+            cv_path = render_pdf(cv_md, tmp / f"{name_slug}_CV_{safe_company}_{safe_title}.pdf")
+            cl_path = render_pdf(cl_md, tmp / f"{name_slug}_CoverLetter_{safe_company}_{safe_title}.pdf")
         except Exception as e:
             _send(token, chat_id, f"❌ PDF rendering failed:\n<code>{_he(str(e))}</code>")
             return
@@ -245,37 +395,12 @@ def generate_and_send_cv(token: str, chat_id: int, url: str) -> None:
         _send_pdf(token, chat_id, cv_path)
         _send_pdf(token, chat_id, cl_path)
 
-    logger.info("Sent CV + cover letter for '%s' at '%s'", title, company)
+    logger.info("Sent CV + cover letter for '%s' at '%s' to chat %s", title, company, chat_id)
 
 
-def _he(text: str) -> str:
-    """Escape HTML special chars for Telegram HTML parse mode."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-# ── Bot loop ──────────────────────────────────────────────────────────────────
-
-_PLAYWRIGHT_NOTE = (
-    "" if _PLAYWRIGHT_AVAILABLE else
-    "\n\n⚠️ <b>JS-rendered pages:</b> If a URL fails, paste the job manually:\n"
-    "<code>title: Software Engineer Intern\ncompany: Acme Corp\n---\n[description here]</code>"
-)
-
-HELP_TEXT = (
-    "👋 <b>Job CV Bot</b>\n\n"
-    "Send me a job posting URL and I'll generate a tailored CV + cover letter.\n\n"
-    "<b>Option 1 — URL:</b>\n"
-    "<code>https://jobs.nvidia.com/jobs/XXXXX</code>\n\n"
-    "<b>Option 2 — Manual text</b> (if URL fails):\n"
-    "<code>title: Software Engineer Intern\n"
-    "company: Acme Corp\n"
-    "---\n"
-    "[paste full job description here]</code>"
-    + _PLAYWRIGHT_NOTE
-)
-
-
-def _handle_manual_text(token: str, chat_id: int, text: str) -> None:
+def _handle_manual_text(
+    token: str, chat_id: int, text: str, user_data: dict, first_name: str
+) -> None:
     """Parse manual format and generate CV without fetching any URL.
 
     Expected format:
@@ -284,6 +409,9 @@ def _handle_manual_text(token: str, chat_id: int, text: str) -> None:
         ---
         <full job description>
     """
+    user_cv = user_data["cv_text"]
+    name_slug = _safe_name(first_name)
+
     try:
         header, _, description = text.partition("---")
         title, company = "", ""
@@ -306,8 +434,8 @@ def _handle_manual_text(token: str, chat_id: int, text: str) -> None:
           f"📋 <b>{_he(title)}</b> at {_he(company)}\n⚙️ Generating CV...")
 
     try:
-        cv_md = generate_tailored_cv(title, company, description)
-        cl_md = generate_cover_letter(title, company, description)
+        cv_md = generate_tailored_cv(title, company, description, user_cv)
+        cl_md = generate_cover_letter(title, company, description, user_cv)
     except Exception as e:
         _send(token, chat_id, f"❌ CV generation failed: {_he(str(e))}")
         return
@@ -318,8 +446,8 @@ def _handle_manual_text(token: str, chat_id: int, text: str) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         try:
-            cv_path = render_pdf(cv_md, tmp / f"OrAtias_CV_{safe_company}_{safe_title}.pdf")
-            cl_path = render_pdf(cl_md, tmp / f"OrAtias_CoverLetter_{safe_company}_{safe_title}.pdf")
+            cv_path = render_pdf(cv_md, tmp / f"{name_slug}_CV_{safe_company}_{safe_title}.pdf")
+            cl_path = render_pdf(cl_md, tmp / f"{name_slug}_CoverLetter_{safe_company}_{safe_title}.pdf")
         except Exception as e:
             _send(token, chat_id, f"❌ PDF rendering failed: {_he(str(e))}")
             return
@@ -328,18 +456,43 @@ def _handle_manual_text(token: str, chat_id: int, text: str) -> None:
         _send_pdf(token, chat_id, cv_path)
         _send_pdf(token, chat_id, cl_path)
 
-    logger.info("Sent CV (manual text) for '%s' at '%s'", title, company)
+    logger.info("Sent CV (manual text) for '%s' at '%s' to chat %s", title, company, chat_id)
+
+
+# ── Bot loop ──────────────────────────────────────────────────────────────────
+
+_PLAYWRIGHT_NOTE = (
+    "" if _PLAYWRIGHT_AVAILABLE else
+    "\n\n⚠️ <b>JS-rendered pages:</b> If a URL fails, paste the job manually:\n"
+    "<code>title: Software Engineer Intern\ncompany: Acme Corp\n---\n[description here]</code>"
+)
+
+HELP_TEXT = (
+    "👋 <b>Job CV Bot</b>\n\n"
+    "Send me your CV first (paste as text or upload PDF/docx), then send job URLs.\n\n"
+    "<b>Commands:</b>\n"
+    "/start — show this welcome message\n"
+    "/updatecv — replace your stored CV\n\n"
+    "<b>Option 1 — URL:</b>\n"
+    "<code>https://jobs.nvidia.com/jobs/XXXXX</code>\n\n"
+    "<b>Option 2 — Manual text</b> (if URL fails):\n"
+    "<code>title: Software Engineer Intern\n"
+    "company: Acme Corp\n"
+    "---\n"
+    "[paste full job description here]</code>"
+    + _PLAYWRIGHT_NOTE
+)
 
 
 def run(token: str) -> None:
     offset = 0
-    logger.info("Bot started — waiting for job URLs...")
+    logger.info("Bot started — waiting for messages...")
 
     while True:
         try:
             result = _api(token, "getUpdates", data={
                 "offset": offset,
-                "timeout": 30,  # long-poll
+                "timeout": 30,
                 "allowed_updates": ["message"],
             })
             updates = result.get("result", [])
@@ -354,28 +507,71 @@ def run(token: str) -> None:
             offset = update["update_id"] + 1
             msg = update.get("message", {})
             chat_id = msg.get("chat", {}).get("id")
+            if not chat_id:
+                continue
+
+            first_name = msg.get("from", {}).get("first_name", "User")
             text = (msg.get("text") or "").strip()
+            document = msg.get("document")
 
-            if not chat_id or not text:
+            if not text and not document:
                 continue
 
+            user_data = _load_user_data(chat_id)
+
+            # ── Commands ──────────────────────────────────────────────────────
             if text in ("/start", "/help"):
-                _send(token, chat_id, HELP_TEXT)
+                _handle_start(token, chat_id, user_data)
                 continue
 
-            # Manual text format: "title: ...\ncompany: ...\n---\n<description>"
-            if text.lower().startswith("title:") and "---" in text:
-                _handle_manual_text(token, chat_id, text)
-                continue
-
-            urls = URL_RE.findall(text)
-            if not urls:
+            if text == "/updatecv":
+                user_data["awaiting_cv"] = True
+                _save_user_data(user_data)
                 _send(token, chat_id,
-                      "📎 Send a job URL, or type /help to see the manual text format.")
+                      "📄 Send your new CV — paste the full text or upload a PDF/docx file.")
                 continue
 
-            # Process the first URL found
-            generate_and_send_cv(token, chat_id, urls[0])
+            # ── Document upload ───────────────────────────────────────────────
+            if document:
+                _handle_document(token, chat_id, document, user_data)
+                continue
+
+            # ── Text messages ─────────────────────────────────────────────────
+            awaiting_cv = user_data.get("awaiting_cv", False)
+            has_cv = bool(user_data.get("cv_text"))
+
+            # URL handling
+            urls = URL_RE.findall(text)
+            if urls:
+                if not has_cv:
+                    _send(token, chat_id,
+                          "📄 Please send your CV first (paste text or upload a PDF/docx file), "
+                          "then I can process job URLs for you.")
+                    user_data["awaiting_cv"] = True
+                    _save_user_data(user_data)
+                    continue
+                generate_and_send_cv(token, chat_id, urls[0], user_data, first_name)
+                continue
+
+            # Manual job format
+            if text.lower().startswith("title:") and "---" in text:
+                if not has_cv:
+                    _send(token, chat_id,
+                          "📄 Please send your CV first before processing job descriptions.")
+                    user_data["awaiting_cv"] = True
+                    _save_user_data(user_data)
+                    continue
+                _handle_manual_text(token, chat_id, text, user_data, first_name)
+                continue
+
+            # Plain text — CV upload path
+            if awaiting_cv or not has_cv:
+                _store_cv(token, chat_id, user_data, text)
+                continue
+
+            # User has CV but sent unrecognised plain text
+            _send(token, chat_id,
+                  "📎 Send a job URL, or type /help to see all options.")
 
 
 def main() -> None:

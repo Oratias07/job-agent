@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import sys
 from datetime import datetime
@@ -232,6 +233,8 @@ def main() -> None:
 
     logger.info("Found %d new job(s). Generating tailored documents...", len(new_jobs))
 
+    owner_cv = os.environ["OWNER_CV"]
+
     # --- Generate tailored CV + cover letter per new job ---
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     attachments: list[Path] = []
@@ -241,14 +244,14 @@ def main() -> None:
         title_slug = _sanitize_filename(job["title"])
 
         try:
-            cv_md = generate_tailored_cv(job["title"], job["company"], job["description"])
+            cv_md = generate_tailored_cv(job["title"], job["company"], job["description"], owner_cv)
             cv_path = render_pdf(cv_md, OUTPUT_DIR / f"OrAtias_CV_{company_slug}_{title_slug}.pdf")
             attachments.append(cv_path)
         except Exception:
             logger.exception("Failed to generate CV for: %s at %s", job["title"], job["company"])
 
         try:
-            cl_md = generate_cover_letter(job["title"], job["company"], job["description"])
+            cl_md = generate_cover_letter(job["title"], job["company"], job["description"], owner_cv)
             cl_path = render_pdf(cl_md, OUTPUT_DIR / f"OrAtias_CoverLetter_{company_slug}_{title_slug}.pdf")
             attachments.append(cl_path)
         except Exception:

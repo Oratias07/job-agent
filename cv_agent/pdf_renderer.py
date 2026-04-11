@@ -1,10 +1,10 @@
-"""Convert Markdown content to styled PDF using WeasyPrint."""
+"""Convert Markdown content to styled PDF using Playwright (Chromium)."""
 
 import html as html_lib
 import logging
 import re
 from pathlib import Path
-from weasyprint import HTML
+from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,17 @@ def render_pdf(markdown_content: str, output_path: str | Path) -> Path:
 <html><head><meta charset="utf-8"><style>{CSS}</style></head>
 <body>{body_html}</body></html>"""
 
-    HTML(string=full_html).write_pdf(str(output_path))
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.set_content(full_html, wait_until="domcontentloaded")
+        page.pdf(
+            path=str(output_path),
+            format="A4",
+            margin={"top": "1.5cm", "bottom": "1.5cm", "left": "2cm", "right": "2cm"},
+            print_background=True,
+        )
+        browser.close()
+
     logger.info("Rendered PDF: %s", output_path)
     return output_path

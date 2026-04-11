@@ -14,9 +14,6 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-SENDER = "chamyproject@gmail.com"
-RECIPIENT = "[REDACTED_EMAIL]"
-
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
 
@@ -25,6 +22,8 @@ def send_email(new_jobs: list[dict], attachments: list[Path]) -> None:
     if not new_jobs:
         return
 
+    sender = os.environ.get("GMAIL_USER", "")
+    recipient = os.environ.get("OWNER_EMAIL", "")
     password = os.environ.get("GMAIL_APP_PASSWORD", "")
     if not password:
         raise ValueError("GMAIL_APP_PASSWORD environment variable not set")
@@ -43,8 +42,8 @@ def send_email(new_jobs: list[dict], attachments: list[Path]) -> None:
     body_lines.append(f"\n{len(attachments)} PDF(s) attached (tailored CV + cover letter per job).")
 
     msg = MIMEMultipart()
-    msg["From"] = SENDER
-    msg["To"] = RECIPIENT
+    msg["From"] = sender
+    msg["To"] = recipient
     msg["Subject"] = subject
     msg.attach(MIMEText("\n".join(body_lines), "plain", "utf-8"))
 
@@ -57,12 +56,12 @@ def send_email(new_jobs: list[dict], attachments: list[Path]) -> None:
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SENDER, password)
+            server.login(sender, password)
             server.send_message(msg)
         logger.info("Email sent: %s", subject)
     except smtplib.SMTPAuthenticationError as e:
         logger.error("Gmail authentication failed: %s", e)
-        logger.error("Sender: %s, Password length: %d", SENDER, len(password))
+        logger.error("Sender: %s, Password length: %d", sender, len(password))
         raise
 
 

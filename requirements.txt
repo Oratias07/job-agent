@@ -2,6 +2,7 @@ requests
 beautifulsoup4
 playwright
 groq
-weasyprint
+pypdf
+python-docx
 pytest
 pytest-mock

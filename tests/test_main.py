@@ -211,6 +211,10 @@ FAKE_JOB = {
 
 
 class TestMainFlow:
+    @pytest.fixture(autouse=True)
+    def owner_cv_env(self, monkeypatch):
+        monkeypatch.setenv("OWNER_CV", "# Test Owner CV\nSoftware Engineer\nEmail: owner@example.com")
+
     def _patch_all(self, mocker, seen_data=None, scraped_jobs=None):
         """Helper: patch all external dependencies for main()."""
         if scraped_jobs is None:

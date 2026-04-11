@@ -47,6 +47,11 @@ class TestSendEmail:
         p.write_bytes(b"%PDF-1.4 fake")
         return p
 
+    @pytest.fixture(autouse=True)
+    def email_env(self, monkeypatch):
+        monkeypatch.setenv("GMAIL_USER", "chamyproject@gmail.com")
+        monkeypatch.setenv("OWNER_EMAIL", "owner@example.com")
+
     def test_raises_if_no_password(self, monkeypatch):
         monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
         with pytest.raises(ValueError, match="GMAIL_APP_PASSWORD"):
