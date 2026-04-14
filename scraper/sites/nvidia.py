@@ -38,7 +38,9 @@ def _scrape_api() -> list[dict]:
             "searchText": search_term,
         }
         resp = requests.post(API_URL, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
+        if not resp.ok:
+            logger.debug("NVIDIA API returned %s for searchText=%r — skipping", resp.status_code, search_term)
+            continue
         data = resp.json()
 
         for posting in data.get("jobPostings", []):
@@ -89,36 +91,42 @@ def _scrape_playwright() -> list[dict]:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(2000)
 
-        cards = page.query_selector_all(
-            "[data-automation='job-card'], .job-card, article, "
-            "div[class*='job'], li[class*='job'], tr[class*='job']"
-        )
-        for card in cards:
+        # NVIDIA's job site uses anchor tags with href containing '/careers/job'
+        job_links = page.query_selector_all("a[href*='/careers/job']")
+        seen_hrefs: set[str] = set()
+        for a in job_links:
             try:
-                title_el = card.query_selector("h2, h3, h4, a[class*='title'], span[class*='title']")
-                if not title_el:
+                href = a.get_attribute("href") or ""
+                if not href or href in seen_hrefs:
                     continue
-                title_text = title_el.inner_text().strip()
-                card_text = card.inner_text().strip()
+                seen_hrefs.add(href)
 
-                if not _matches_keywords(title_text + " " + card_text):
+                title_text = a.inner_text().strip()
+                # The link element may contain the job ID and location as extra text;
+                # take only the first non-empty line as the title
+                title_text = next((ln.strip() for ln in title_text.splitlines() if ln.strip()), title_text)
+
+                if not title_text or len(title_text) < 5:
                     continue
 
-                link_el = card.query_selector("a[href]")
-                link = link_el.get_attribute("href") if link_el else ""
-                if link and not link.startswith("http"):
-                    link = f"https://jobs.nvidia.com{link}"
+                if not _matches_keywords(title_text):
+                    continue
 
-                job_id = f"nvidia-{hashlib.md5((title_text + link).encode()).hexdigest()[:8]}"
+                if not href.startswith("http"):
+                    href = f"https://jobs.nvidia.com{href}"
+
+                # Extract numeric job ID from path
+                slug = href.rstrip("/").split("/")[-1]
+                job_id = f"nvidia-{slug}"
                 jobs.append({
                     "id": job_id,
                     "title": title_text,
                     "company": "NVIDIA",
-                    "url": link or BROWSE_URL,
-                    "description": card_text,
+                    "url": href,
+                    "description": title_text,
                 })
             except Exception:
-                logger.debug("Failed to parse a card on NVIDIA", exc_info=True)
+                logger.debug("Failed to parse a job link on NVIDIA", exc_info=True)
 
         browser.close()
     return jobs
