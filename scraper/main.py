@@ -12,7 +12,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scraper.sites import microsoft_rnd, microsoft_careers, nvidia, indeed, alljobs, drushim, hiemetech
+from scraper.sites import (
+    microsoft_rnd, microsoft_careers, nvidia, indeed, alljobs, drushim, hiemetech,
+    google_careers, wix_jobs, checkpoint_careers, monday_jobs,
+)
 from cv_agent.tailor import generate_tailored_cv, generate_cover_letter
 from cv_agent.pdf_renderer import render_pdf
 from scraper.notifier import send_email, send_telegram
@@ -68,8 +71,10 @@ _COMPANY_ALIASES: dict[str, list[str]] = {
     "apple": ["apple"],
     "salesforce": ["salesforce"],
     "amdocs": ["amdocs"],
-    "checkpoint": ["check point", "checkpoint"],
+    "checkpoint": ["check point software technologies", "check point", "checkpoint"],
     "wix": ["wix.com", "wix"],
+    "monday": ["monday.com", "monday"],
+    "google": ["google israel", "google"],
 }
 
 
@@ -115,7 +120,10 @@ _TECH_TITLE_KEYWORDS: list[str] = [
 ]
 
 # Companies with curated tech-only scraping — skip the tech-keyword title check
-_CURATED_TECH_COMPANIES: set[str] = {"microsoft r&d israel", "microsoft", "nvidia"}
+_CURATED_TECH_COMPANIES: set[str] = {
+    "microsoft r&d israel", "microsoft", "nvidia",
+    "google", "wix", "check point", "monday.com",
+}
 
 
 def _is_relevant_job(job: dict) -> bool:
@@ -173,6 +181,10 @@ def main() -> None:
         ("Microsoft R&D Israel", microsoft_rnd.scrape),
         ("Microsoft Careers", microsoft_careers.scrape),
         ("NVIDIA", nvidia.scrape),
+        ("Google Careers", google_careers.scrape),
+        ("Wix Careers", wix_jobs.scrape),
+        ("Check Point Careers", checkpoint_careers.scrape),
+        ("Monday.com Careers", monday_jobs.scrape),
         ("Indeed Israel", indeed.scrape),
         ("AllJobs", alljobs.scrape),
         ("Drushim", drushim.scrape),

@@ -2,8 +2,8 @@ name: Job Monitor
 
 on:
   schedule:
-    # 09:00 and 16:00 Israel time (UTC+3 / UTC+2 DST)
-    - cron: '0 6,13 * * *'
+    # Every 24 minutes — 3 runs/hour, 72 runs/day
+    - cron: '*/24 * * * *'
   workflow_dispatch: # Allow manual trigger
 
 permissions:
@@ -20,11 +20,32 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ hashFiles('requirements.txt') }}
+
       - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: |
-          pip install -r requirements.txt
           playwright install chromium
-          playwright install-deps
+          playwright install-deps chromium
+
+      - name: Install Playwright system deps (cached restore)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: playwright install-deps chromium
 
       - name: Run job monitor
         env:

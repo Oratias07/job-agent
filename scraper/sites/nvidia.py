@@ -12,7 +12,7 @@ API_URL = "https://nvidia.wd5.myworkdayjobs.com/wday/cxs/nvidia/NVIDIAExternalCa
 
 BROWSE_URL = (
     "https://jobs.nvidia.com/careers"
-    "?query=Student&start=0&location=Israel&pid=893391945660"
+    "?query=Student+Intern&start=0&location=Israel&pid=893391945660"
     "&sort_by=relevance&filter_include_remote=1"
 )
 
@@ -25,41 +25,54 @@ def _matches_keywords(text: str) -> bool:
 
 
 def _scrape_api() -> list[dict]:
-    """Try NVIDIA's Workday REST API."""
-    payload = {
-        "appliedFacets": {"locationCountry": ["bc33aa3152ec42d4995f4791a106ed09"]},  # Israel
-        "limit": 20,
-        "offset": 0,
-        "searchText": "Student",
-    }
+    """Try NVIDIA's Workday REST API — searches for both 'Student' and 'Intern'."""
     headers = {"Content-Type": "application/json"}
-    resp = requests.post(API_URL, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    seen_ids: set[str] = set()
+    jobs: list[dict] = []
 
-    jobs = []
-    for posting in data.get("jobPostings", []):
-        title = posting.get("title", "")
-        bullet_fields = posting.get("bulletFields", [])
-        description = " ".join(bullet_fields) + " " + title
-        external_path = posting.get("externalPath", "")
-        url = f"https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite{external_path}" if external_path else BROWSE_URL
+    for search_term in ["student", "intern", "Student", "Intern"]:
+        payload = {
+            "appliedFacets": {"locationCountry": ["bc33aa3152ec42d4995f4791a106ed09"]},  # Israel
+            "limit": 20,
+            "offset": 0,
+            "searchText": search_term,
+        }
+        resp = requests.post(API_URL, json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
 
-        if not _matches_keywords(title + " " + description):
-            continue
+        for posting in data.get("jobPostings", []):
+            title = posting.get("title", "")
+            bullet_fields = posting.get("bulletFields", [])
+            description = " ".join(bullet_fields) + " " + title
+            external_path = posting.get("externalPath", "")
+            url = (
+                f"https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite{external_path}"
+                if external_path else BROWSE_URL
+            )
 
-        job_id = f"nvidia-{hashlib.md5(title.encode()).hexdigest()[:8]}"
-        if external_path:
-            # Use the path slug as a more stable ID
-            job_id = f"nvidia-{external_path.strip('/').split('/')[-1]}"
+            if not _matches_keywords(title + " " + description):
+                continue
 
-        jobs.append({
-            "id": job_id,
-            "title": title,
-            "company": "NVIDIA",
-            "url": url,
-            "description": description,
-        })
+            # Stable ID: use the Workday path slug when available
+            job_id = (
+                f"nvidia-{external_path.strip('/').split('/')[-1]}"
+                if external_path
+                else f"nvidia-{hashlib.md5(title.encode()).hexdigest()[:8]}"
+            )
+
+            if job_id in seen_ids:
+                continue
+            seen_ids.add(job_id)
+
+            jobs.append({
+                "id": job_id,
+                "title": title,
+                "company": "NVIDIA",
+                "url": url,
+                "description": description,
+            })
+
     return jobs
 
 
