@@ -17,13 +17,18 @@ Run this script on any machine with the two env vars set.
 It uses long-polling — no webhook/server needed.
 """
 
+import collections
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -68,21 +73,99 @@ HEADERS = {
 
 USER_DATA_DIR = PROJECT_ROOT / "user_data"
 MIN_CV_LENGTH = 100  # characters — anything shorter is rejected as too short
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+# ── Concurrency ───────────────────────────────────────────────────────────────
+# Worker threads: each user request runs in its own thread so the polling loop
+# never blocks. Cap at 10 so Groq API parallelism stays manageable.
+MAX_WORKERS = 10
+
+# Playwright (Chromium) is memory-heavy (~150–200 MB per browser). Cap the
+# number of simultaneous instances across all threads to avoid OOM.
+MAX_PLAYWRIGHT_INSTANCES = 5
+_playwright_sem = threading.Semaphore(MAX_PLAYWRIGHT_INSTANCES)
+
+# Per-user file locks: prevent concurrent reads/writes to the same JSON file
+# when a user sends two messages in rapid succession.
+_user_locks: dict[int, threading.Lock] = {}
+_user_locks_meta = threading.Lock()
+
+def _get_user_lock(chat_id: int) -> threading.Lock:
+    with _user_locks_meta:
+        if chat_id not in _user_locks:
+            _user_locks[chat_id] = threading.Lock()
+        return _user_locks[chat_id]
+
+# ── Rate limiting ────────────────────────────────────────────────────────────
+_RATE_WINDOW = 60        # seconds
+_RATE_MAX = 5            # max requests per window per user
+_rate_buckets: dict[int, collections.deque] = {}
+_rate_lock = threading.Lock()  # guards _rate_buckets across threads
+
+def _check_rate_limit(chat_id: int) -> bool:
+    """Return True if the user is within their rate limit, False if exceeded."""
+    now = time.time()
+    with _rate_lock:
+        dq = _rate_buckets.setdefault(chat_id, collections.deque())
+        while dq and now - dq[0] > _RATE_WINDOW:
+            dq.popleft()
+        if len(dq) >= _RATE_MAX:
+            return False
+        dq.append(now)
+    return True
+
+# ── SSRF protection ──────────────────────────────────────────────────────────
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),   # link-local / AWS metadata
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+]
+
+def _validate_url(url: str) -> None:
+    """Raise ValueError if the URL targets a private/internal address (SSRF guard)."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http:// and https:// URLs are allowed")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL has no hostname")
+    if host.lower() in ("localhost", "0.0.0.0"):
+        raise ValueError("Blocked host")
+    try:
+        ip = ipaddress.ip_address(socket.gethostbyname(host))
+    except socket.gaierror as e:
+        raise ValueError(f"Could not resolve hostname: {e}") from e
+    for net in _BLOCKED_NETWORKS:
+        if ip in net:
+            raise ValueError(f"URL resolves to a private/internal address ({ip}) — not allowed")
+
+# ── Log sanitization ─────────────────────────────────────────────────────────
+def _safe_log(s: str) -> str:
+    """Remove newlines and control chars from untrusted strings going into logs."""
+    return re.sub(r"[\x00-\x1f\x7f]", "?", str(s))[:120]
 
 
 # ── User data storage ─────────────────────────────────────────────────────────
 
 def _load_user_data(chat_id: int) -> dict:
     path = USER_DATA_DIR / f"{chat_id}.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
+    with _get_user_lock(chat_id):
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
     return {"chat_id": chat_id}
 
 
 def _save_user_data(data: dict) -> None:
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    path = USER_DATA_DIR / f"{data['chat_id']}.json"
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    chat_id = data["chat_id"]
+    path = USER_DATA_DIR / f"{chat_id}.json"
+    with _get_user_lock(chat_id):
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ── Telegram helpers ─────────────────────────────────────────────────────────
@@ -209,9 +292,16 @@ def _handle_document(token: str, chat_id: int, document: dict, user_data: dict) 
     mime_type = document.get("mime_type", "")
     file_name = document.get("file_name", "")
     file_id = document.get("file_id", "")
+    file_size = document.get("file_size", 0)
 
     if not file_id:
         _send(token, chat_id, "❌ Could not read the uploaded file.")
+        return
+
+    if file_size > MAX_FILE_SIZE:
+        _send(token, chat_id,
+              f"❌ File is too large ({file_size // 1024 // 1024}MB). "
+              "Please upload a file under 5MB.")
         return
 
     _send(token, chat_id, "⏳ Processing your CV file...")
@@ -256,15 +346,22 @@ def _extract_with_playwright(url: str) -> tuple[str, str, str]:
     """Slow path: render JS-heavy pages with Playwright."""
     if not _PLAYWRIGHT_AVAILABLE:
         raise RuntimeError("Playwright is not installed in this environment.")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, timeout=60000)
-        page.wait_for_timeout(3000)
-        html = page.content()
-        browser.close()
+    with _playwright_sem:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=60000)
+            page.wait_for_timeout(3000)
+            html = page.content()
+            browser.close()
     soup = BeautifulSoup(html, "html.parser")
     return _parse_soup(soup, url)
+
+
+def _render_pdf_safe(markdown: str, path: Path) -> Path:
+    """Render PDF with the Playwright concurrency semaphore held."""
+    with _playwright_sem:
+        return render_pdf(markdown, path)
 
 
 def _parse_soup(soup: BeautifulSoup, url: str) -> tuple[str, str, str]:
@@ -327,6 +424,7 @@ def fetch_job_page(url: str) -> tuple[str, str, str]:
 
     Tries fast HTTP first; falls back to Playwright if available.
     """
+    _validate_url(url)  # SSRF guard — raises ValueError for private/internal targets
     try:
         return _extract_with_requests(url)
     except Exception as e:
@@ -385,8 +483,8 @@ def generate_and_send_cv(
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         try:
-            cv_path = render_pdf(cv_md, tmp / f"{name_slug}_CV_{safe_company}_{safe_title}.pdf")
-            cl_path = render_pdf(cl_md, tmp / f"{name_slug}_CoverLetter_{safe_company}_{safe_title}.pdf")
+            cv_path = _render_pdf_safe(cv_md, tmp / f"{name_slug}_CV_{safe_company}_{safe_title}.pdf")
+            cl_path = _render_pdf_safe(cl_md, tmp / f"{name_slug}_CoverLetter_{safe_company}_{safe_title}.pdf")
         except Exception as e:
             _send(token, chat_id, f"❌ PDF rendering failed:\n<code>{_he(str(e))}</code>")
             return
@@ -395,7 +493,8 @@ def generate_and_send_cv(
         _send_pdf(token, chat_id, cv_path)
         _send_pdf(token, chat_id, cl_path)
 
-    logger.info("Sent CV + cover letter for '%s' at '%s' to chat %s", title, company, chat_id)
+    logger.info("Sent CV + cover letter for '%s' at '%s' to chat %s",
+                _safe_log(title), _safe_log(company), chat_id)
 
 
 def _handle_manual_text(
@@ -446,8 +545,8 @@ def _handle_manual_text(
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         try:
-            cv_path = render_pdf(cv_md, tmp / f"{name_slug}_CV_{safe_company}_{safe_title}.pdf")
-            cl_path = render_pdf(cl_md, tmp / f"{name_slug}_CoverLetter_{safe_company}_{safe_title}.pdf")
+            cv_path = _render_pdf_safe(cv_md, tmp / f"{name_slug}_CV_{safe_company}_{safe_title}.pdf")
+            cl_path = _render_pdf_safe(cl_md, tmp / f"{name_slug}_CoverLetter_{safe_company}_{safe_title}.pdf")
         except Exception as e:
             _send(token, chat_id, f"❌ PDF rendering failed: {_he(str(e))}")
             return
@@ -456,7 +555,8 @@ def _handle_manual_text(
         _send_pdf(token, chat_id, cv_path)
         _send_pdf(token, chat_id, cl_path)
 
-    logger.info("Sent CV (manual text) for '%s' at '%s' to chat %s", title, company, chat_id)
+    logger.info("Sent CV (manual text) for '%s' at '%s' to chat %s",
+                _safe_log(title), _safe_log(company), chat_id)
 
 
 # ── Bot loop ──────────────────────────────────────────────────────────────────
@@ -472,7 +572,8 @@ HELP_TEXT = (
     "Send me your CV first (paste as text or upload PDF/docx), then send job URLs.\n\n"
     "<b>Commands:</b>\n"
     "/start — show this welcome message\n"
-    "/updatecv — replace your stored CV\n\n"
+    "/updatecv — replace your stored CV\n"
+    "/deletecv — permanently delete your stored CV and data\n\n"
     "<b>Option 1 — URL:</b>\n"
     "<code>https://jobs.nvidia.com/jobs/XXXXX</code>\n\n"
     "<b>Option 2 — Manual text</b> (if URL fails):\n"
@@ -484,94 +585,134 @@ HELP_TEXT = (
 )
 
 
-def run(token: str) -> None:
-    offset = 0
-    logger.info("Bot started — waiting for messages...")
+def _process_update(token: str, update: dict) -> None:
+    """Handle a single Telegram update. Runs inside a worker thread."""
+    msg = update.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    if not chat_id:
+        return
 
-    while True:
-        try:
-            result = _api(token, "getUpdates", data={
-                "offset": offset,
-                "timeout": 30,
-                "allowed_updates": ["message"],
-            })
-            updates = result.get("result", [])
-        except requests.exceptions.Timeout:
-            continue
-        except Exception:
-            logger.exception("getUpdates error — retrying in 5s")
-            time.sleep(5)
-            continue
+    first_name = msg.get("from", {}).get("first_name", "User")
+    text = (msg.get("text") or "").strip()
+    document = msg.get("document")
 
-        for update in updates:
-            offset = update["update_id"] + 1
-            msg = update.get("message", {})
-            chat_id = msg.get("chat", {}).get("id")
-            if not chat_id:
-                continue
+    if not text and not document:
+        return
 
-            first_name = msg.get("from", {}).get("first_name", "User")
-            text = (msg.get("text") or "").strip()
-            document = msg.get("document")
+    try:
+        user_data = _load_user_data(chat_id)
 
-            if not text and not document:
-                continue
+        # ── Commands ──────────────────────────────────────────────────────
+        if text in ("/start", "/help"):
+            _handle_start(token, chat_id, user_data)
+            return
 
-            user_data = _load_user_data(chat_id)
+        if text == "/updatecv":
+            user_data["awaiting_cv"] = True
+            _save_user_data(user_data)
+            _send(token, chat_id,
+                  "📄 Send your new CV — paste the full text or upload a PDF/docx file.")
+            return
 
-            # ── Commands ──────────────────────────────────────────────────────
-            if text in ("/start", "/help"):
-                _handle_start(token, chat_id, user_data)
-                continue
+        if text == "/deletecv":
+            path = USER_DATA_DIR / f"{chat_id}.json"
+            with _get_user_lock(chat_id):
+                if path.exists():
+                    path.unlink()
+                    deleted = True
+                else:
+                    deleted = False
+            if deleted:
+                _send(token, chat_id,
+                      "🗑️ Your CV and all stored data have been permanently deleted.")
+            else:
+                _send(token, chat_id, "No stored data found for your account.")
+            return
 
-            if text == "/updatecv":
+        # ── Document upload ───────────────────────────────────────────────
+        if document:
+            _handle_document(token, chat_id, document, user_data)
+            return
+
+        # ── Text messages ─────────────────────────────────────────────────
+        awaiting_cv = user_data.get("awaiting_cv", False)
+        has_cv = bool(user_data.get("cv_text"))
+
+        # URL handling
+        urls = URL_RE.findall(text)
+        if urls:
+            if not has_cv:
+                _send(token, chat_id,
+                      "📄 Please send your CV first (paste text or upload a PDF/docx file), "
+                      "then I can process job URLs for you.")
                 user_data["awaiting_cv"] = True
                 _save_user_data(user_data)
+                return
+            if not _check_rate_limit(chat_id):
                 _send(token, chat_id,
-                      "📄 Send your new CV — paste the full text or upload a PDF/docx file.")
+                      f"⏳ Slow down — max {_RATE_MAX} requests per minute. Try again shortly.")
+                return
+            generate_and_send_cv(token, chat_id, urls[0], user_data, first_name)
+            return
+
+        # Manual job format
+        if text.lower().startswith("title:") and "---" in text:
+            if not has_cv:
+                _send(token, chat_id,
+                      "📄 Please send your CV first before processing job descriptions.")
+                user_data["awaiting_cv"] = True
+                _save_user_data(user_data)
+                return
+            if not _check_rate_limit(chat_id):
+                _send(token, chat_id,
+                      f"⏳ Slow down — max {_RATE_MAX} requests per minute. Try again shortly.")
+                return
+            _handle_manual_text(token, chat_id, text, user_data, first_name)
+            return
+
+        # Plain text — CV upload path
+        if awaiting_cv or not has_cv:
+            _store_cv(token, chat_id, user_data, text)
+            return
+
+        # User has CV but sent unrecognised plain text
+        _send(token, chat_id,
+              "📎 Send a job URL, or type /help to see all options.")
+
+    except Exception:
+        logger.exception("Unhandled error processing update for chat %s", chat_id)
+        try:
+            _send(token, chat_id, "❌ An unexpected error occurred. Please try again.")
+        except Exception:
+            pass
+
+
+def run(token: str) -> None:
+    offset = 0
+    logger.info("Bot started — %d worker threads, max %d Playwright instances",
+                MAX_WORKERS, MAX_PLAYWRIGHT_INSTANCES)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="bot-worker") as pool:
+        while True:
+            try:
+                result = _api(token, "getUpdates", data={
+                    "offset": offset,
+                    "timeout": 30,
+                    "allowed_updates": ["message"],
+                })
+                updates = result.get("result", [])
+            except requests.exceptions.Timeout:
+                continue
+            except Exception:
+                logger.exception("getUpdates error — retrying in 5s")
+                time.sleep(5)
                 continue
 
-            # ── Document upload ───────────────────────────────────────────────
-            if document:
-                _handle_document(token, chat_id, document, user_data)
-                continue
-
-            # ── Text messages ─────────────────────────────────────────────────
-            awaiting_cv = user_data.get("awaiting_cv", False)
-            has_cv = bool(user_data.get("cv_text"))
-
-            # URL handling
-            urls = URL_RE.findall(text)
-            if urls:
-                if not has_cv:
-                    _send(token, chat_id,
-                          "📄 Please send your CV first (paste text or upload a PDF/docx file), "
-                          "then I can process job URLs for you.")
-                    user_data["awaiting_cv"] = True
-                    _save_user_data(user_data)
-                    continue
-                generate_and_send_cv(token, chat_id, urls[0], user_data, first_name)
-                continue
-
-            # Manual job format
-            if text.lower().startswith("title:") and "---" in text:
-                if not has_cv:
-                    _send(token, chat_id,
-                          "📄 Please send your CV first before processing job descriptions.")
-                    user_data["awaiting_cv"] = True
-                    _save_user_data(user_data)
-                    continue
-                _handle_manual_text(token, chat_id, text, user_data, first_name)
-                continue
-
-            # Plain text — CV upload path
-            if awaiting_cv or not has_cv:
-                _store_cv(token, chat_id, user_data, text)
-                continue
-
-            # User has CV but sent unrecognised plain text
-            _send(token, chat_id,
-                  "📎 Send a job URL, or type /help to see all options.")
+            for update in updates:
+                # Advance offset immediately in the poll thread — never in a worker —
+                # so a worker crash doesn't cause the same update to be reprocessed.
+                offset = update["update_id"] + 1
+                pool.submit(_process_update, token, update)
 
 
 def main() -> None:
