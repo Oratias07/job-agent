@@ -14,11 +14,13 @@
   "msrnd-200036076": {
     "title": "Security Research Intern - AI Focus",
     "company": "Microsoft R&D Israel",
-    "url": "https://www.microsoftrnd.co.il/JobDetails?JobSeqNo=200036076"
+    "url": "https://www.microsoftrnd.co.il/JobDetails?JobSeqNo=200036076",
+    "baseline": true
   },
   "msrnd-200028527": {
     "title": "Security Research Intern",
     "company": "Microsoft R&D Israel",
-    "url": "https://www.microsoftrnd.co.il/JobDetails?JobSeqNo=200028527"
+    "url": "https://www.microsoftrnd.co.il/JobDetails?JobSeqNo=200028527",
+    "baseline": true
   }
 }
