@@ -1,11 +1,12 @@
-"""Scraper for Monday.com Careers Israel — uses Lever ATS public API."""
+"""Scraper for Monday.com Careers Israel — uses Greenhouse ATS public API."""
 
 import logging
 import requests
 
 logger = logging.getLogger(__name__)
 
-LEVER_API = "https://api.lever.co/v0/postings/monday"
+# Monday.com migrated from Lever to Greenhouse
+GREENHOUSE_API = "https://boards-api.greenhouse.io/v1/boards/mondaydotcom/jobs"
 FALLBACK_URL = "https://monday.com/jobs"
 
 KEYWORDS = ["student", "intern", "internship", "part-time", "part time",
@@ -30,45 +31,37 @@ def scrape() -> list[dict]:
     jobs: list[dict] = []
 
     try:
-        resp = requests.get(LEVER_API, headers=HEADERS, timeout=30, params={"mode": "json"})
+        resp = requests.get(
+            GREENHOUSE_API, headers=HEADERS, timeout=30, params={"content": "true"}
+        )
         resp.raise_for_status()
-        postings = resp.json()
+        postings = resp.json().get("jobs", [])
     except Exception:
-        logger.exception("Monday.com: Lever API failed")
+        logger.exception("Monday.com: Greenhouse API failed")
         return jobs
 
     for posting in postings:
-        title = posting.get("text", "").strip()
-        categories = posting.get("categories", {})
-        location = categories.get("location", "") if isinstance(categories, dict) else ""
-        apply_url = posting.get("hostedUrl", "") or posting.get("applyUrl", "")
-        job_id_raw = posting.get("id", "")
+        title = posting.get("title", "").strip()
+        location_obj = posting.get("location", {})
+        location = location_obj.get("name", "") if isinstance(location_obj, dict) else ""
+        apply_url = posting.get("absolute_url", "") or posting.get("url", "")
+        job_id_raw = str(posting.get("id", ""))
+        content = posting.get("content", "") or ""
 
-        # Only Israel locations
         loc_lower = location.lower()
         if location and "israel" not in loc_lower and "tel aviv" not in loc_lower and "haifa" not in loc_lower:
             continue
 
-        lists = posting.get("lists", [])
-        desc_text = " ".join(
-            item.get("text", "") + " " + " ".join(item.get("content", []))
-            for item in lists
-            if isinstance(item, dict)
-        )
-        desc_text = desc_text[:800]
-
-        full_text = title + " " + desc_text + " " + categories.get("team", "")
-        if not _matches_keywords(full_text):
+        if not _matches_keywords(title + " " + content):
             continue
 
         job_id = f"monday-{job_id_raw}" if job_id_raw else f"monday-{title[:30]}"
-
         jobs.append({
             "id": job_id,
             "title": title,
             "company": "Monday.com",
             "url": apply_url or FALLBACK_URL,
-            "description": f"{location}\n{desc_text}".strip(),
+            "description": f"{location}\n{content[:800]}".strip(),
         })
 
     logger.info("Monday.com Careers: found %d matching jobs", len(jobs))

@@ -5,9 +5,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Wix uses Greenhouse ATS; their board slug is 'wix'
-GREENHOUSE_API = "https://boards-api.greenhouse.io/v1/boards/wix/jobs"
-FALLBACK_URL = "https://www.wix.com/jobs"
+# Wix may use different Greenhouse board slugs — try in order
+GREENHOUSE_SLUGS = ["wixcom", "wix", "wix-com"]
+GREENHOUSE_BASE = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+FALLBACK_URL = "https://www.wix.com/jobs/locations/israel"
 
 KEYWORDS = ["student", "intern", "internship", "part-time", "part time",
             "junior", "associate", "סטודנט", "התמחות"]
@@ -26,19 +27,32 @@ def _matches_keywords(text: str) -> bool:
     return any(kw in text_lower for kw in KEYWORDS)
 
 
+def _fetch_greenhouse(slug: str) -> list[dict] | None:
+    """Try a Greenhouse board slug, return postings list or None on failure."""
+    url = GREENHOUSE_BASE.format(slug=slug)
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30, params={"content": "true"})
+        resp.raise_for_status()
+        return resp.json().get("jobs", [])
+    except Exception:
+        return None
+
+
 def scrape() -> list[dict]:
     """Return list of job dicts from Wix Careers."""
+    postings = None
+    for slug in GREENHOUSE_SLUGS:
+        postings = _fetch_greenhouse(slug)
+        if postings is not None:
+            logger.info("Wix: using Greenhouse slug '%s'", slug)
+            break
+
+    if postings is None:
+        logger.error("Wix: all Greenhouse slugs failed — %s", GREENHOUSE_SLUGS)
+        return []
+
     jobs: list[dict] = []
-
-    try:
-        resp = requests.get(GREENHOUSE_API, headers=HEADERS, timeout=30, params={"content": "true"})
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        logger.exception("Wix: Greenhouse API failed")
-        return jobs
-
-    for posting in data.get("jobs", []):
+    for posting in postings:
         title = posting.get("title", "").strip()
         location_obj = posting.get("location", {})
         location = location_obj.get("name", "") if isinstance(location_obj, dict) else ""
@@ -46,17 +60,14 @@ def scrape() -> list[dict]:
         job_id_raw = str(posting.get("id", ""))
         content = posting.get("content", "") or ""
 
-        # Only Israel positions
         loc_lower = location.lower()
         if location and "israel" not in loc_lower and "tel aviv" not in loc_lower and "haifa" not in loc_lower:
             continue
 
-        full_text = title + " " + content
-        if not _matches_keywords(full_text):
+        if not _matches_keywords(title + " " + content):
             continue
 
         job_id = f"wix-{job_id_raw}" if job_id_raw else f"wix-{title[:30]}"
-
         jobs.append({
             "id": job_id,
             "title": title,

@@ -1,14 +1,25 @@
-"""Scraper for Microsoft Careers global site (JS-rendered, uses Playwright)."""
+"""Scraper for Microsoft Careers global site — uses the public search REST API."""
 
 import hashlib
 import logging
-from playwright.sync_api import sync_playwright
+import requests
 
 logger = logging.getLogger(__name__)
 
-URL = "https://apply.careers.microsoft.com/careers?domain=microsoft.com"
+# Microsoft's public careers search API (no Playwright needed)
+API_URL = "https://gcsservices.careers.microsoft.com/search/api/v1/search"
+JOB_BASE_URL = "https://jobs.careers.microsoft.com/global/en/job/"
 
-KEYWORDS = ["student", "intern", "סטודנט", "התמחות", "internship"]
+KEYWORDS = ["student", "intern", "internship", "סטודנט", "התמחות"]
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
 
 
 def _matches_keywords(text: str) -> bool:
@@ -17,69 +28,60 @@ def _matches_keywords(text: str) -> bool:
 
 
 def scrape() -> list[dict]:
-    """Return list of job dicts: {id, title, company, url, description}."""
-    jobs = []
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(URL, timeout=60000)
+    """Return list of job dicts from Microsoft Careers global."""
+    jobs: list[dict] = []
+    seen_ids: set[str] = set()
 
-            # Wait for job cards to render
-            page.wait_for_timeout(5000)
+    for keyword in ["intern", "student"]:
+        try:
+            params = {
+                "q": keyword,
+                "lc": "Israel",
+                "l": "en_us",
+                "pg": "1",
+                "pgSz": "20",
+                "o": "Relevance",
+                "flt": "true",
+            }
+            resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logger.exception("Microsoft Careers: API request failed for query '%s'", keyword)
+            continue
 
-            # Try scrolling to load more results
-            for _ in range(3):
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(2000)
+        for posting in data.get("operationResult", {}).get("result", {}).get("jobs", []):
+            title = posting.get("title", "").strip()
+            job_id_raw = str(posting.get("jobId", ""))
+            description = posting.get("description", "").strip()
+            location = posting.get("location", "").strip()
 
-            # Extract job cards — Microsoft Careers uses various selectors
-            cards = page.query_selector_all(
-                "[data-automation='job-card'], "
-                ".ms-List-cell, "
-                "[role='listitem'], "
-                ".job-card, "
-                "article[class*='job'], "
-                "div[class*='JobCard'], "
-                "div[class*='jobCard']"
+            # Filter to Israel only
+            loc_lower = location.lower()
+            if location and "israel" not in loc_lower and "tel aviv" not in loc_lower:
+                continue
+
+            if not _matches_keywords(title + " " + description):
+                continue
+
+            url = f"{JOB_BASE_URL}{job_id_raw}" if job_id_raw else ""
+            job_id = (
+                f"mscareer-{job_id_raw}"
+                if job_id_raw
+                else f"mscareer-{hashlib.md5((title + url).encode()).hexdigest()[:8]}"
             )
 
-            for card in cards:
-                try:
-                    title = card.query_selector(
-                        "h2, h3, h4, [data-automation='job-title'], "
-                        "a[class*='title'], span[class*='title']"
-                    )
-                    if not title:
-                        continue
-                    title_text = title.inner_text().strip()
-                    card_text = card.inner_text().strip()
+            if job_id in seen_ids:
+                continue
+            seen_ids.add(job_id)
 
-                    if not _matches_keywords(title_text + " " + card_text):
-                        continue
-
-                    link_el = card.query_selector("a[href]")
-                    link = link_el.get_attribute("href") if link_el else ""
-                    if link and not link.startswith("http"):
-                        link = f"https://apply.careers.microsoft.com{link}"
-
-                    # Try to extract a job ID from the link or card
-                    job_id = f"mscareer-{hashlib.md5((title_text + link).encode()).hexdigest()[:8]}"
-
-                    jobs.append({
-                        "id": job_id,
-                        "title": title_text,
-                        "company": "Microsoft",
-                        "url": link or URL,
-                        "description": card_text,
-                    })
-                except Exception:
-                    logger.debug("Failed to parse a card on Microsoft Careers", exc_info=True)
-
-            browser.close()
-
-    except Exception:
-        logger.exception("Failed to scrape Microsoft Careers")
+            jobs.append({
+                "id": job_id,
+                "title": title,
+                "company": "Microsoft",
+                "url": url or "https://jobs.careers.microsoft.com",
+                "description": f"{location}\n{description}".strip(),
+            })
 
     logger.info("Microsoft Careers: found %d matching jobs", len(jobs))
     return jobs
